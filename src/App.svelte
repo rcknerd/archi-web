@@ -1,15 +1,38 @@
 <script lang="ts">
   import { ArchiModelEngine } from './lib/model/ArchiModelEngine';
   import type { ArchiModel, DiagramView } from './lib/model/types';
-  import { FolderOpen, File, ChevronRight, ChevronDown, Layers, Box, Cpu, Network, Zap } from '@lucide/svelte';
+  import {
+    FolderOpen,
+    File,
+    ChevronRight,
+    ChevronDown,
+    Layers,
+    Box,
+    Cpu,
+    Network,
+    Zap,
+    Save,
+  } from '@lucide/svelte';
+  import DiagramCanvas from './lib/canvas/DiagramCanvas.svelte';
 
   const engine = new ArchiModelEngine();
+  const ARCHIMATE_PICKER_TYPES = [
+    {
+      description: 'ArchiMate Model',
+      accept: { 'application/xml': ['.archimate'], 'text/xml': ['.archimate'] },
+    },
+  ];
 
   let model = $state<ArchiModel | null>(null);
   let activeView = $state<DiagramView | null>(null);
   let isLoading = $state(false);
+  let isSaving = $state(false);
   let errorMsg = $state('');
-  let expandedFolders = $state(new Set<string>());
+  let statusNote = $state('');
+  let expandedFolders = $state(new Set<string>(['views']));
+  let fileHandle = $state<FileSystemFileHandle | null>(null);
+  let fileName = $state('');
+  let dirty = $state(false);
 
   const layerIcon: Record<string, any> = {
     strategy: Zap,
@@ -35,20 +58,130 @@
 
   async function openFile() {
     try {
-      const [fileHandle] = await (window as any).showOpenFilePicker({
-        types: [{ description: 'ArchiMate Model', accept: { 'application/xml': ['.archimate'] } }],
+      if (!(window as any).showOpenFilePicker) {
+        // Fallback for browsers without File System Access API
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.archimate,application/xml,text/xml';
+        input.onchange = async () => {
+          const file = input.files?.[0];
+          if (!file) return;
+          await loadFromText(await file.text(), null, file.name);
+        };
+        input.click();
+        return;
+      }
+      const [handle] = await (window as any).showOpenFilePicker({
+        types: ARCHIMATE_PICKER_TYPES,
         multiple: false,
       });
       isLoading = true;
       errorMsg = '';
-      const file = await fileHandle.getFile();
-      const text = await file.text();
-      model = engine.parseXmlModel(text);
-      activeView = model.views[0] ?? null;
+      const file = await handle.getFile();
+      await loadFromText(await file.text(), handle, file.name);
     } catch (e: any) {
       if (e?.name !== 'AbortError') errorMsg = `Failed to open file: ${e?.message}`;
     } finally {
       isLoading = false;
+    }
+  }
+
+  async function loadFromText(
+    text: string,
+    handle: FileSystemFileHandle | null,
+    name: string,
+  ) {
+    isLoading = true;
+    errorMsg = '';
+    try {
+      const parsed = engine.parseXmlModel(text);
+      model = parsed;
+      activeView = parsed.views[0] ?? null;
+      fileHandle = handle;
+      fileName = name;
+      dirty = false;
+      statusNote = `Loaded ${parsed.elements.size} elements · ${parsed.views.length} views`;
+      // Expand views + layers that have content
+      const next = new Set<string>(['views']);
+      for (const el of parsed.elements.values()) next.add(el.layer);
+      expandedFolders = next;
+    } catch (e: any) {
+      errorMsg = `Failed to parse model: ${e?.message || e}`;
+      model = null;
+      activeView = null;
+    } finally {
+      isLoading = false;
+    }
+  }
+
+  async function saveFile() {
+    if (!model) return;
+    try {
+      isSaving = true;
+      errorMsg = '';
+      const xml = engine.serializeXmlModel(model);
+      const blob = new Blob([xml], { type: 'application/xml' });
+
+      if (fileHandle && 'createWritable' in fileHandle) {
+        const writable = await (fileHandle as any).createWritable();
+        await writable.write(blob);
+        await writable.close();
+      } else if ((window as any).showSaveFilePicker) {
+        const handle = await (window as any).showSaveFilePicker({
+          suggestedName: fileName || `${model.name || 'model'}.archimate`,
+          types: ARCHIMATE_PICKER_TYPES,
+        });
+        const writable = await handle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+        fileHandle = handle;
+        fileName = handle.name || fileName;
+      } else {
+        // Anchor download fallback
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName || `${model.name || 'model'}.archimate`;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+      dirty = false;
+      statusNote = `Saved ${fileName || 'model.archimate'}`;
+    } catch (e: any) {
+      if (e?.name !== 'AbortError') errorMsg = `Failed to save: ${e?.message}`;
+    } finally {
+      isSaving = false;
+    }
+  }
+
+  async function saveFileAs() {
+    if (!model) return;
+    // Force picker even if we already have a handle
+    const prev = fileHandle;
+    fileHandle = null;
+    try {
+      if (!(window as any).showSaveFilePicker) {
+        await saveFile();
+        return;
+      }
+      isSaving = true;
+      const xml = engine.serializeXmlModel(model);
+      const handle = await (window as any).showSaveFilePicker({
+        suggestedName: fileName || `${model.name || 'model'}.archimate`,
+        types: ARCHIMATE_PICKER_TYPES,
+      });
+      const writable = await handle.createWritable();
+      await writable.write(new Blob([xml], { type: 'application/xml' }));
+      await writable.close();
+      fileHandle = handle;
+      fileName = handle.name || fileName;
+      dirty = false;
+      statusNote = `Saved as ${fileName}`;
+    } catch (e: any) {
+      fileHandle = prev;
+      if (e?.name !== 'AbortError') errorMsg = `Failed to save: ${e?.message}`;
+    } finally {
+      isSaving = false;
     }
   }
 
@@ -60,13 +193,41 @@
       if (!groups[g]) groups[g] = [];
       groups[g].push(el);
     }
-    return groups;
+    // Stable layer order
+    const order = [
+      'strategy',
+      'business',
+      'application',
+      'technology',
+      'physical',
+      'motivation',
+      'implementation',
+      'other',
+    ];
+    const sorted: Record<string, any[]> = {};
+    for (const k of order) {
+      if (groups[k]) sorted[k] = groups[k].sort((a, b) => a.name.localeCompare(b.name));
+    }
+    return sorted;
   }
 
   function toggleFolder(key: string) {
     const next = new Set(expandedFolders);
     next.has(key) ? next.delete(key) : next.add(key);
     expandedFolders = next;
+  }
+
+  function selectView(view: DiagramView) {
+    activeView = view;
+  }
+
+  function countNodes(nodes: { children?: any[] }[]): number {
+    let n = 0;
+    for (const node of nodes) {
+      n += 1;
+      if (node.children?.length) n += countNodes(node.children);
+    }
+    return n;
   }
 </script>
 
@@ -80,14 +241,24 @@
     <nav class="toolbar-actions">
       <button class="btn btn-primary" onclick={openFile} disabled={isLoading}>
         <FolderOpen size={14} />
-        {isLoading ? 'Loading…' : 'Open .archimate'}
+        {isLoading ? 'Loading…' : 'Open'}
+      </button>
+      <button class="btn" onclick={saveFile} disabled={!model || isSaving} title="Save model">
+        <Save size={14} />
+        {isSaving ? 'Saving…' : 'Save'}
+      </button>
+      <button class="btn" onclick={saveFileAs} disabled={!model || isSaving} title="Save as…">
+        Save as…
       </button>
     </nav>
     {#if model}
-      <div class="toolbar-model-name">{model.name}</div>
+      <div class="toolbar-model-name" title={fileName || model.name}>
+        {model.name}{dirty ? ' •' : ''}
+        {#if fileName}<span class="toolbar-filename">{fileName}</span>{/if}
+      </div>
     {/if}
     <div class="toolbar-spacer"></div>
-    <div class="toolbar-badge">Phase 1 · Parser & Model Engine</div>
+    <div class="toolbar-badge">Phases 2–3 · Explorer & Canvas</div>
   </header>
 
   <!-- ── Body ── -->
@@ -112,9 +283,10 @@
                 <li>
                   <button
                     class="sidebar-item {activeView?.id === view.id ? 'active' : ''}"
-                    onclick={() => activeView = view}>
+                    onclick={() => selectView(view)}>
                     <File size={12} />
-                    {view.name}
+                    <span class="item-name">{view.name}</span>
+                    <span class="item-type">{view.nodes.length}</span>
                   </button>
                 </li>
               {/each}
@@ -146,12 +318,22 @@
           </section>
         {/each}
 
-        <!-- Relationships summary -->
+        <!-- Relationships -->
         <section class="sidebar-section">
-          <div class="sidebar-section-header sidebar-section-header--static">
-            <ChevronRight size={12}/>
+          <button class="sidebar-section-header" onclick={() => toggleFolder('relationships')}>
+            {#if expandedFolders.has('relationships')}<ChevronDown size={12}/>{:else}<ChevronRight size={12}/>{/if}
             Relationships <span class="sidebar-count">{model.relationships.size}</span>
-          </div>
+          </button>
+          {#if expandedFolders.has('relationships')}
+            <ul class="sidebar-list">
+              {#each [...model.relationships.values()] as rel}
+                <li class="sidebar-item-row">
+                  <span class="item-name">{rel.name || rel.type.replace(/Relationship$/, '')}</span>
+                  <span class="item-type">{rel.type.replace(/Relationship$/, '')}</span>
+                </li>
+              {/each}
+            </ul>
+          {/if}
         </section>
       {/if}
     </aside>
@@ -177,24 +359,17 @@
         <div class="canvas-view-header">
           <span class="view-label">View</span>
           <span class="view-name">{activeView.name}</span>
-          <span class="view-stats">{activeView.nodes.length} nodes · {activeView.connections.length} connections</span>
+          {#if activeView.viewpoint}
+            <span class="view-viewpoint">{activeView.viewpoint}</span>
+          {/if}
+          <span class="view-stats"
+            >{countNodes(activeView.nodes)} nodes · {activeView.connections.length} connections</span
+          >
         </div>
-        <div class="canvas-diagram-placeholder">
-          <div class="phase-notice">
-            <Cpu size={18} />
-            <strong>Phase 1 complete</strong> — Model parsed successfully. maxGraph canvas rendering arrives in Phase 3.
-          </div>
-          <div class="element-preview-grid">
-            {#each activeView.nodes as node}
-              {@const elem = model.elements.get(node.archimateElementId ?? '')}
-              <div class="element-card"
-                   style="--el-color:{layerVar[elem?.layer ?? 'other']}">
-                <div class="element-card-type">{elem?.type ?? node.type}</div>
-                <div class="element-card-name">{node.name || elem?.name || node.id}</div>
-                <div class="element-card-pos">{node.x},{node.y} · {node.width}×{node.height}</div>
-              </div>
-            {/each}
-          </div>
+        <div class="canvas-live">
+          {#key activeView.id}
+            <DiagramCanvas view={activeView} model={model} />
+          {/key}
         </div>
       {:else}
         <div class="canvas-welcome">
@@ -210,11 +385,15 @@
       <span>✓ {model.elements.size} elements · {model.relationships.size} relationships · {model.views.length} views</span>
       <span class="statusbar-sep">|</span>
       <span>ArchiMate {model.version}</span>
+      {#if statusNote}
+        <span class="statusbar-sep">|</span>
+        <span>{statusNote}</span>
+      {/if}
     {:else}
-      <span>No model loaded</span>
+      <span>No model loaded — open a .archimate file</span>
     {/if}
     <div class="statusbar-spacer"></div>
-    <span>Issue #1 — WASM Model Engine</span>
+    <span>Issues #2–#3</span>
   </footer>
 </div>
 
@@ -322,8 +501,6 @@
     font-family: var(--font-sans);
   }
   .sidebar-section-header:hover { color: var(--text-primary); background: var(--bg-hover); }
-  .sidebar-section-header--static { cursor: default; }
-  .sidebar-section-header--static:hover { background: transparent; color: var(--text-secondary); }
 
   .sidebar-count {
     margin-left: auto;
@@ -442,40 +619,28 @@
   }
   .view-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); }
   .view-name { font-weight: 600; color: var(--text-primary); font-size: 13px; }
+  .view-viewpoint {
+    font-size: 10px;
+    color: var(--accent-blue);
+    background: var(--accent-blue-glow);
+    border-radius: 10px;
+    padding: 1px 8px;
+  }
   .view-stats { font-size: 11px; color: var(--text-muted); margin-left: auto; }
+  .toolbar-filename {
+    display: block;
+    font-size: 10px;
+    color: var(--text-muted);
+    font-weight: 400;
+  }
+  .toolbar-actions :global(.btn:disabled) { opacity: 0.45; cursor: not-allowed; }
 
-  .canvas-diagram-placeholder { flex: 1; padding: 24px; overflow: auto; }
-  .phase-notice {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 12px 16px;
-    background: var(--bg-elevated);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    color: var(--text-secondary);
-    font-size: 12px;
-    margin-bottom: 20px;
+  .canvas-live {
+    flex: 1;
+    overflow: hidden;
+    position: relative;
+    min-height: 0;
   }
-  .phase-notice strong { color: var(--accent-green); }
-
-  .element-preview-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-    gap: 12px;
-  }
-  .element-card {
-    background: var(--bg-elevated);
-    border: 1px solid var(--border-subtle);
-    border-top: 3px solid var(--el-color, var(--text-muted));
-    border-radius: var(--radius-md);
-    padding: 12px;
-    transition: border-color 0.15s, background 0.15s;
-  }
-  .element-card:hover { background: var(--bg-hover); border-color: var(--el-color, var(--border-default)); }
-  .element-card-type { font-size: 10px; color: var(--text-muted); font-family: var(--font-mono); margin-bottom: 4px; }
-  .element-card-name { font-size: 13px; font-weight: 500; color: var(--text-primary); margin-bottom: 6px; }
-  .element-card-pos { font-size: 10px; color: var(--text-muted); font-family: var(--font-mono); }
 
   /* ── Statusbar ── */
   .statusbar {

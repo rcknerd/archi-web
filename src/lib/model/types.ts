@@ -1,4 +1,4 @@
-export type ArchiLayer = 
+export type ArchiLayer =
   | 'strategy'
   | 'business'
   | 'application'
@@ -15,6 +15,8 @@ export interface ArchiElement {
   layer: ArchiLayer;
   documentation?: string;
   properties?: Record<string, string>;
+  /** Containing folder id when known */
+  folderId?: string;
 }
 
 export interface ArchiRelationship {
@@ -25,6 +27,15 @@ export interface ArchiRelationship {
   targetId: string;
   documentation?: string;
   properties?: Record<string, string>;
+  folderId?: string;
+}
+
+/** Archi-native relative bend-point (start* vs source, end* vs target). */
+export interface ArchiBendpoint {
+  startX: number;
+  startY: number;
+  endX: number;
+  endY: number;
 }
 
 export interface DiagramConnection {
@@ -34,12 +45,15 @@ export interface DiagramConnection {
   targetId: string;
   type?: string;
   name?: string;
-  bendpoints?: Array<{ x: number; y: number }>;
+  bendpoints?: ArchiBendpoint[];
+  lineColor?: string;
 }
 
 export interface DiagramNode {
   id: string;
   archimateElementId?: string;
+  /** For DiagramModelReference nodes */
+  modelRefId?: string;
   name: string;
   type: string;
   x: number;
@@ -56,8 +70,16 @@ export interface DiagramView {
   id: string;
   name: string;
   documentation?: string;
+  viewpoint?: string;
   nodes: DiagramNode[];
   connections: DiagramConnection[];
+}
+
+export interface ArchiFolder {
+  id: string;
+  name: string;
+  type?: string;
+  parentId?: string;
 }
 
 export interface ArchiModel {
@@ -68,4 +90,5 @@ export interface ArchiModel {
   elements: Map<string, ArchiElement>;
   relationships: Map<string, ArchiRelationship>;
   views: DiagramView[];
+  folders?: ArchiFolder[];
 }
