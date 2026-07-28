@@ -173,11 +173,18 @@ export function styleForElementType(
     case 'service':
       return { ...base, rounded: 1, arcSize: 20, verticalAlign: opts.hasChildren ? 'top' : 'middle' };
     case 'component':
-      return { ...base, shape: 'module', verticalAlign: opts.hasChildren ? 'top' : 'middle' };
-    case 'note':
+      // 'module' is not a built-in maxGraph shape — use rectangle with thicker stroke
       return {
         ...base,
-        shape: 'note',
+        shape: 'rectangle',
+        strokeWidth: 2,
+        verticalAlign: opts.hasChildren ? 'top' : 'middle',
+      };
+    case 'note':
+      // 'note' is not a built-in maxGraph shape — approximate with label/rect
+      return {
+        ...base,
+        shape: 'label',
         fillColor: opts.fillColor || '#ffffcc',
         verticalAlign: 'top',
         align: 'left',
