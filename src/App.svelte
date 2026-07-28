@@ -1,6 +1,8 @@
 <script lang="ts">
   import { ArchiModelEngine } from './lib/model/ArchiModelEngine';
-  import type { ArchiModel, DiagramView } from './lib/model/types';
+  import type { ArchiModel, DiagramView, DiagramNode } from './lib/model/types';
+  import type { Selection } from './lib/model/selection';
+  import { EMPTY_SELECTION } from './lib/model/selection';
   import {
     FolderOpen,
     File,
@@ -14,6 +16,7 @@
     Save,
   } from '@lucide/svelte';
   import DiagramCanvas from './lib/canvas/DiagramCanvas.svelte';
+  import PropertiesPane from './lib/ui/PropertiesPane.svelte';
 
   const engine = new ArchiModelEngine();
   const ARCHIMATE_PICKER_TYPES = [
@@ -33,6 +36,9 @@
   let fileHandle = $state<FileSystemFileHandle | null>(null);
   let fileName = $state('');
   let dirty = $state(false);
+  let selection = $state<Selection>({ ...EMPTY_SELECTION });
+  /** Bumps to remount the canvas after structural view changes (e.g. drop). */
+  let viewEpoch = $state(0);
 
   const layerIcon: Record<string, any> = {
     strategy: Zap,
@@ -97,6 +103,7 @@
       const parsed = engine.parseXmlModel(text);
       model = parsed;
       activeView = parsed.views[0] ?? null;
+      selection = { ...EMPTY_SELECTION };
       fileHandle = handle;
       fileName = name;
       dirty = false;
@@ -109,6 +116,7 @@
       errorMsg = `Failed to parse model: ${e?.message || e}`;
       model = null;
       activeView = null;
+      selection = { ...EMPTY_SELECTION };
     } finally {
       isLoading = false;
     }
@@ -219,6 +227,93 @@
 
   function selectView(view: DiagramView) {
     activeView = view;
+    selection = { kind: 'view', id: view.id, viewId: view.id };
+  }
+
+  function selectElement(el: { id: string }) {
+    selection = { kind: 'element', id: el.id, elementId: el.id };
+  }
+
+  function selectRelationship(rel: { id: string }) {
+    selection = { kind: 'relationship', id: rel.id };
+  }
+
+  function onCanvasSelect(sel: Selection) {
+    selection = sel;
+  }
+
+  function clearSelection() {
+    selection = { ...EMPTY_SELECTION };
+  }
+
+  /** Update diagram node position after drag on canvas (in-memory; Save persists). */
+  function onNodeMove(payload: { diagramNodeId: string; x: number; y: number }) {
+    if (!activeView || !model) return;
+    const update = (nodes: DiagramNode[]): boolean => {
+      for (const n of nodes) {
+        if (n.id === payload.diagramNodeId) {
+          n.x = Math.round(payload.x);
+          n.y = Math.round(payload.y);
+          return true;
+        }
+        if (n.children?.length && update(n.children)) return true;
+      }
+      return false;
+    };
+    // Mutate the active view tree
+    if (update(activeView.nodes)) {
+      dirty = true;
+      statusNote = 'Moved element (unsaved)';
+      // Trigger reactivity for activeView reference
+      activeView = activeView;
+      model = model;
+    }
+  }
+
+  /** Drop an explorer element onto the diagram (adds a diagram object if missing). */
+  function onCanvasDropElement(payload: { elementId: string; x: number; y: number }) {
+    if (!activeView || !model) return;
+    const el = model.elements.get(payload.elementId);
+    if (!el) return;
+
+    const alreadyOnView = (nodes: DiagramNode[]): boolean => {
+      for (const n of nodes) {
+        if (n.archimateElementId === payload.elementId) return true;
+        if (n.children?.length && alreadyOnView(n.children)) return true;
+      }
+      return false;
+    };
+    if (alreadyOnView(activeView.nodes)) {
+      selection = { kind: 'element', id: el.id, elementId: el.id };
+      statusNote = `"${el.name}" is already on this view`;
+      return;
+    }
+
+    const id = `diag-${crypto.randomUUID?.() || Date.now()}`;
+    const node: DiagramNode = {
+      id,
+      archimateElementId: el.id,
+      name: el.name,
+      type: 'DiagramObject',
+      x: Math.round(payload.x),
+      y: Math.round(payload.y),
+      width: 120,
+      height: 55,
+    };
+    activeView.nodes = [...activeView.nodes, node];
+    // Force canvas remount via view identity-preserving update + key bump
+    activeView = { ...activeView, nodes: activeView.nodes };
+    model = model;
+    dirty = true;
+    selection = {
+      kind: 'diagram-node',
+      id: el.id,
+      elementId: el.id,
+      diagramNodeId: id,
+      viewId: activeView.id,
+    };
+    statusNote = `Added "${el.name}" to view (unsaved)`;
+    viewEpoch += 1;
   }
 
   function countNodes(nodes: { children?: any[] }[]): number {
@@ -229,6 +324,12 @@
     }
     return n;
   }
+
+  const selectedKey = $derived(
+    selection.kind === 'none'
+      ? ''
+      : selection.diagramNodeId || selection.elementId || selection.id,
+  );
 </script>
 
 <div class="workbench">
@@ -258,7 +359,7 @@
       </div>
     {/if}
     <div class="toolbar-spacer"></div>
-    <div class="toolbar-badge">Phases 2–3 · Explorer & Canvas</div>
+    <div class="toolbar-badge">Phase 4 · Select · Move · Inspect</div>
   </header>
 
   <!-- ── Body ── -->
@@ -307,10 +408,22 @@
               <ul class="sidebar-list">
                 {#each elements as el}
                   {@const IconComp = layerIcon[el.layer] ?? Box}
-                  <li class="sidebar-item-row">
-                    <IconComp size={12} />
-                    <span class="item-name">{el.name || el.id}</span>
-                    <span class="item-type">{el.type.replace(/^I/, '')}</span>
+                  <li>
+                    <button
+                      type="button"
+                      class="sidebar-item {selection.elementId === el.id || selection.id === el.id ? 'active' : ''}"
+                      onclick={() => selectElement(el)}
+                      draggable="true"
+                      ondragstart={(e) => {
+                        e.dataTransfer?.setData('application/x-archi-element', el.id);
+                        e.dataTransfer!.effectAllowed = 'copy';
+                      }}
+                      title="Click to inspect · Drag onto diagram (coming soon)"
+                    >
+                      <IconComp size={12} />
+                      <span class="item-name">{el.name || el.id}</span>
+                      <span class="item-type">{el.type.replace(/^I/, '')}</span>
+                    </button>
                   </li>
                 {/each}
               </ul>
@@ -327,9 +440,15 @@
           {#if expandedFolders.has('relationships')}
             <ul class="sidebar-list">
               {#each [...model.relationships.values()] as rel}
-                <li class="sidebar-item-row">
-                  <span class="item-name">{rel.name || rel.type.replace(/Relationship$/, '')}</span>
-                  <span class="item-type">{rel.type.replace(/Relationship$/, '')}</span>
+                <li>
+                  <button
+                    type="button"
+                    class="sidebar-item {selection.id === rel.id ? 'active' : ''}"
+                    onclick={() => selectRelationship(rel)}
+                  >
+                    <span class="item-name">{rel.name || rel.type.replace(/Relationship$/, '')}</span>
+                    <span class="item-type">{rel.type.replace(/Relationship$/, '')}</span>
+                  </button>
                 </li>
               {/each}
             </ul>
@@ -367,8 +486,15 @@
           >
         </div>
         <div class="canvas-live">
-          {#key activeView.id}
-            <DiagramCanvas view={activeView} model={model} />
+          {#key `${activeView.id}-${viewEpoch}`}
+            <DiagramCanvas
+              view={activeView}
+              model={model}
+              selectedId={selectedKey}
+              onselect={onCanvasSelect}
+              onmove={onNodeMove}
+              ondropelement={onCanvasDropElement}
+            />
           {/key}
         </div>
       {:else}
@@ -377,6 +503,14 @@
         </div>
       {/if}
     </main>
+
+    <!-- Properties / selection info -->
+    <PropertiesPane
+      model={model}
+      selection={selection}
+      activeView={activeView}
+      onclear={clearSelection}
+    />
   </div>
 
   <!-- ── Status bar ── -->
@@ -393,7 +527,11 @@
       <span>No model loaded — open a .archimate file</span>
     {/if}
     <div class="statusbar-spacer"></div>
-    <span>Issues #2–#3</span>
+    {#if selection.kind !== 'none'}
+      <span class="statusbar-sep">|</span>
+      <span>Selected: {selection.kind} · {selection.id.slice(0, 12)}</span>
+    {/if}
+    <span>Phase 4 WIP</span>
   </footer>
 </div>
 
@@ -538,17 +676,6 @@
   .sidebar-item:hover { background: var(--bg-hover); color: var(--text-primary); }
   .sidebar-item.active { background: var(--bg-active); color: var(--accent-blue); }
 
-  /* Row-based element items (non-interactive) */
-  .sidebar-item-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 10px 4px 20px;
-    font-size: 12px;
-    color: var(--text-secondary);
-    overflow: hidden;
-  }
-  .sidebar-item-row:hover { background: var(--bg-hover); }
   .item-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .item-type {
     font-size: 10px;

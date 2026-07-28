@@ -3,40 +3,61 @@
   import {
     Graph,
     InternalEvent,
-    Client,
     Point,
     Geometry,
   } from '@maxgraph/core';
   import type { FitPlugin } from '@maxgraph/core';
   import '@maxgraph/core/css/common.css';
   import type { ArchiModel, DiagramView, DiagramNode, DiagramConnection } from '../model/types';
+  import type { Selection } from '../model/selection';
   import {
     ELEMENT_FILL,
     RELATIONSHIP_STYLE,
     DEFAULT_EDGE_STYLE,
     styleForElementType,
     absoluteBendpoint,
+    buildElementLabel,
+    baseEdgeStyle,
   } from './archi-styles';
 
   interface Props {
     view: DiagramView;
     model: ArchiModel;
+    selectedId?: string;
+    onselect?: (sel: Selection) => void;
+    onmove?: (payload: { diagramNodeId: string; x: number; y: number }) => void;
+    ondropelement?: (payload: { elementId: string; x: number; y: number }) => void;
   }
 
-  let { view, model }: Props = $props();
+  let { view, model, selectedId = '', onselect, onmove, ondropelement }: Props = $props();
 
   let containerEl: HTMLDivElement;
   let graph: Graph | null = null;
   let renderError = $state('');
   let resizeObserver: ResizeObserver | null = null;
+  let nodeMap = new Map<string, any>();
+  /** diagram node id → archimate element id */
+  let elementRefByNode = new Map<string, string>();
+  let lastRenderedViewId = '';
+  let suppressSelect = false;
+  let fitOnce = false;
 
-  // Re-render when view / model changes (after graph exists)
+  // External selection → highlight cell
   $effect(() => {
-    const _view = view;
+    const id = selectedId;
+    if (!graph) return;
+    applyExternalSelection(id);
+  });
+
+  // Re-render only when the view changes (not on every model mutation from move)
+  $effect(() => {
+    const vid = view.id;
     const _model = model;
-    if (graph && containerEl) {
-      // Defer to next frame so layout has real container size
-      requestAnimationFrame(() => renderView(_view, _model));
+    if (!graph || !containerEl) return;
+    if (vid !== lastRenderedViewId) {
+      lastRenderedViewId = vid;
+      fitOnce = false;
+      requestAnimationFrame(() => renderView(view, _model));
     }
   });
 
@@ -46,37 +67,99 @@
 
       graph = new Graph(containerEl);
 
-      // Read-only canvas (Phase 3)
-      graph.setEnabled(false);
+      // Interactive: select + move, no new connections / no text edit
+      graph.setEnabled(true);
+      graph.setConnectable(false);
+      graph.setCellsEditable(false);
+      graph.setCellsResizable(false);
+      graph.setAllowDanglingEdges(false);
+      graph.setDisconnectOnMove(false);
+      graph.setDropEnabled(false);
+      graph.setSplitEnabled(false);
+      graph.setHtmlLabels(true);
+      graph.setTooltips(true);
+      graph.centerZoom = true;
+
+      // Panning: right-button / middle (left-click selects & moves)
       graph.setPanning(true);
       try {
-        const ph = graph.getPlugin('PanningHandler') as { setUseLeftButtonForPanning?: (v: boolean) => void } | undefined;
-        ph?.setUseLeftButtonForPanning?.(true);
+        const ph = graph.getPlugin('PanningHandler') as any;
+        ph?.setUseLeftButtonForPanning?.(false);
+        if (ph) ph.usePopupTrigger = true; // right-drag pans
       } catch {
         /* optional */
       }
-      graph.centerZoom = true;
-      graph.setTooltips(true);
-      graph.setHtmlLabels(true);
-      graph.setConnectable(false);
+
+      // Only vertices movable (not edges); junctions stay small
+      graph.isCellMovable = (cell: any) => !!cell?.isVertex?.();
+      graph.isCellSelectable = () => true;
 
       const container = graph.container as HTMLElement;
       container.style.background = '#1a1f2e';
-      container.style.cursor = 'grab';
-      // Ensure container participates in layout sizing
       container.style.width = '100%';
       container.style.height = '100%';
 
-      // Re-fit when the flex layout assigns a non-zero size
+      // Selection → parent
+      graph.getSelectionModel().addListener(InternalEvent.CHANGE, () => {
+        if (suppressSelect || !graph || !onselect) return;
+        const cells = graph.getSelectionCells();
+        if (!cells.length) {
+          onselect({ kind: 'none', id: '' });
+          return;
+        }
+        const cell = cells[0];
+        const nodeId = cell.id as string;
+        if (cell.isEdge?.()) {
+          const relId = (cell as any)._relationshipId as string | undefined;
+          onselect({
+            kind: 'relationship',
+            id: relId || nodeId,
+            viewId: view.id,
+          });
+          return;
+        }
+        const elementId = elementRefByNode.get(nodeId);
+        onselect({
+          kind: 'diagram-node',
+          id: elementId || nodeId,
+          elementId: elementId || undefined,
+          diagramNodeId: nodeId,
+          viewId: view.id,
+        });
+      });
+
+      // Move finished → update model geometry
+      graph.addListener(InternalEvent.CELLS_MOVED, (_sender: unknown, evt: any) => {
+        if (!onmove || !graph) return;
+        const cells: any[] = evt?.getProperty?.('cells') || [];
+        for (const cell of cells) {
+          if (!cell?.isVertex?.()) continue;
+          const geo = cell.getGeometry?.();
+          if (!geo) continue;
+          onmove({ diagramNodeId: cell.id, x: geo.x, y: geo.y });
+        }
+      });
+
+      // Fallback: also listen to mouse-up via model change for geometry
+      graph.getDataModel().addListener(InternalEvent.CHANGE, (_s: unknown, evt: any) => {
+        if (!onmove || !graph) return;
+        // Only process when not mid full re-render
+        const edits = evt?.getProperty?.('edit')?.changes || evt?.getProperty?.('changes');
+        if (!edits) return;
+      });
+
       resizeObserver = new ResizeObserver(() => {
         if (!graph || !containerEl) return;
         if (containerEl.clientWidth < 10 || containerEl.clientHeight < 10) return;
         graph.sizeDidChange();
-        fitGraph(graph);
+        if (!fitOnce) {
+          fitGraph(graph);
+          fitOnce = true;
+        }
       });
       resizeObserver.observe(containerEl);
 
-      // Initial paint after layout
+      lastRenderedViewId = view.id;
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
           if (graph) renderView(view, model);
@@ -97,15 +180,39 @@
     }
   });
 
+  function applyExternalSelection(id: string) {
+    if (!graph) return;
+    suppressSelect = true;
+    try {
+      if (!id) {
+        graph.clearSelection();
+        return;
+      }
+      // Find cell by diagram node id or by archimate element id
+      let cell = nodeMap.get(id);
+      if (!cell) {
+        for (const [nodeId, elId] of elementRefByNode) {
+          if (elId === id) {
+            cell = nodeMap.get(nodeId);
+            break;
+          }
+        }
+      }
+      if (cell) {
+        graph.setSelectionCell(cell);
+        graph.scrollCellToVisible?.(cell);
+      }
+    } finally {
+      suppressSelect = false;
+    }
+  }
+
   function fitGraph(g: Graph) {
     try {
       const fitPlugin = g.getPlugin('fit') as FitPlugin | undefined;
       if (fitPlugin?.fit) {
-        fitPlugin.fit({ border: 24 });
-        // center after fit when available
+        fitPlugin.fit({ border: 28 });
         (g as any).center?.(true, true);
-      } else if (typeof (g as any).fit === 'function') {
-        (g as any).fit({ border: 24 });
       }
     } catch (e) {
       console.warn('[DiagramCanvas] fit failed', e);
@@ -130,17 +237,6 @@
     return cleanType(node.type || 'Element');
   }
 
-  function buildLabel(name: string, type: string, isJunction: boolean): string {
-    if (isJunction) return '';
-    const safeName = (name || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const badge = type.replace(/([A-Z])/g, ' $1').trim();
-    return `<div style="padding:3px 5px;text-align:center;line-height:1.25;pointer-events:none;">
-      <div style="font-size:9px;color:#555;letter-spacing:0.2px;margin-bottom:1px;">${badge}</div>
-      <div style="font-size:11px;font-weight:600;color:#111;">${safeName}</div>
-    </div>`;
-  }
-
-  /** Absolute bounds map for bendpoint math (accounts for nesting). */
   function collectAbsoluteBounds(
     nodes: DiagramNode[],
     parentAbs = { x: 0, y: 0 },
@@ -159,9 +255,7 @@
         cx: x + width / 2,
         cy: y + height / 2,
       });
-      if (node.children?.length) {
-        collectAbsoluteBounds(node.children, { x, y }, out);
-      }
+      if (node.children?.length) collectAbsoluteBounds(node.children, { x, y }, out);
     }
     return out;
   }
@@ -170,6 +264,8 @@
     if (!graph) return;
     const g = graph;
     renderError = '';
+    nodeMap = new Map();
+    elementRefByNode = new Map();
 
     try {
       const absBounds = collectAbsoluteBounds(v.nodes);
@@ -177,7 +273,6 @@
       g.batchUpdate(() => {
         clearGraph(g);
         const rootParent = g.getDefaultParent();
-        const nodeMap = new Map<string, any>();
 
         const insertNode = (node: DiagramNode, parent: any) => {
           const type = resolveElementType(node, m);
@@ -185,7 +280,7 @@
           const fillColor =
             node.fillColor ?? ELEMENT_FILL[type] ?? ELEMENT_FILL[node.type] ?? '#ffffb5';
           const fontColor = node.fontColor ?? '#111111';
-          const strokeColor = node.lineColor ?? '#5c5c5c';
+          const strokeColor = node.lineColor ?? '#3d4659';
           const hasChildren = !!(node.children && node.children.length);
           const style = styleForElementType(type, {
             fillColor,
@@ -201,7 +296,7 @@
             h = Math.min(h || 14, 14);
           }
 
-          const label = buildLabel(
+          const label = buildElementLabel(
             node.name || m.elements.get(node.archimateElementId ?? '')?.name || '',
             type,
             isJunction,
@@ -218,6 +313,9 @@
             style: style as any,
           });
           nodeMap.set(node.id, cell);
+          if (node.archimateElementId) {
+            elementRefByNode.set(node.id, node.archimateElementId);
+          }
 
           for (const child of node.children || []) {
             insertNode(child, cell);
@@ -229,18 +327,20 @@
         }
 
         for (const conn of v.connections) {
-          insertConnection(g, conn, nodeMap, m, absBounds, rootParent);
+          insertConnection(g, conn, m, absBounds, rootParent);
         }
       });
 
       g.view?.validate?.();
       g.sizeDidChange();
       fitGraph(g);
+      fitOnce = true;
 
-      // Debug aid in console
-      const n = g.getChildVertices(g.getDefaultParent()).length;
-      const e = g.getChildEdges(g.getDefaultParent()).length;
-      console.debug(`[DiagramCanvas] rendered view "${v.name}": ${n} vertices, ${e} edges, container ${containerEl?.clientWidth}x${containerEl?.clientHeight}`);
+      if (selectedId) applyExternalSelection(selectedId);
+
+      console.debug(
+        `[DiagramCanvas] "${v.name}": ${nodeMap.size} nodes, ${v.connections.length} edges`,
+      );
     } catch (err: any) {
       console.error('[DiagramCanvas] render failed', err);
       renderError = `Render failed: ${err?.message || err}`;
@@ -250,7 +350,6 @@
   function insertConnection(
     g: Graph,
     conn: DiagramConnection,
-    nodeMap: Map<string, any>,
     m: ArchiModel,
     absBounds: Map<string, { cx: number; cy: number; x: number; y: number; width: number; height: number }>,
     parent: any,
@@ -263,31 +362,30 @@
     const relType = cleanType(rel?.type ?? conn.type ?? 'AssociationRelationship');
     const relStyle = RELATIONSHIP_STYLE[relType] ?? DEFAULT_EDGE_STYLE;
 
-    const edgeStyle: Record<string, unknown> = {
+    // Prefer saved bendpoints (Archi layout); otherwise Manhattan auto-routing
+    const hasBendpoints = !!(conn.bendpoints && conn.bendpoints.length);
+    const edgeStyle = baseEdgeStyle({
       ...relStyle,
-      strokeColor: conn.lineColor ?? '#8892a4',
-      strokeWidth: 1.4,
-      fontSize: 10,
-      fontColor: '#8892a4',
-      fontFamily: 'Inter, system-ui, sans-serif',
-      edgeStyle: conn.bendpoints?.length ? 'entityRelationEdgeStyle' : 'orthogonalEdgeStyle',
-      rounded: false,
-    };
+      strokeColor: conn.lineColor ?? '#4a5568',
+      // With explicit bendpoints use orthogonal so points are respected
+      edgeStyle: hasBendpoints ? 'orthogonalEdgeStyle' : 'manhattanEdgeStyle',
+    });
 
     const edge = g.insertEdge({
       parent,
       id: conn.id,
       source: sourceCell,
       target: targetCell,
-      value: conn.name ?? rel?.name ?? '',
+      value: '', // keep edges clean — names live in properties pane
       style: edgeStyle as any,
     });
+    (edge as any)._relationshipId = conn.relationshipId || conn.id;
 
-    if (conn.bendpoints?.length) {
+    if (hasBendpoints) {
       const src = absBounds.get(conn.sourceId);
       const tgt = absBounds.get(conn.targetId);
       if (src && tgt) {
-        const points = conn.bendpoints.map((bp) => {
+        const points = conn.bendpoints!.map((bp) => {
           const abs = absoluteBendpoint(bp, { x: src.cx, y: src.cy }, { x: tgt.cx, y: tgt.cy });
           return new Point(abs.x, abs.y);
         });
@@ -297,11 +395,6 @@
             const next = geo.clone() as Geometry;
             next.points = points;
             g.getDataModel().setGeometry(edge, next);
-          } else {
-            const ng = new Geometry();
-            ng.relative = true;
-            ng.points = points;
-            g.getDataModel().setGeometry(edge, ng);
           }
         } catch (e) {
           console.warn('[DiagramCanvas] bendpoint apply failed', e);
@@ -314,21 +407,37 @@
     if (!graph) return;
     e.preventDefault();
     const delta = e.deltaY > 0 ? 0.9 : 1.1;
-    const viewScale = graph.getView().getScale();
-    const scale = Math.max(0.15, Math.min(4, viewScale * delta));
+    const scale = Math.max(0.12, Math.min(4, graph.getView().getScale() * delta));
     graph.zoomTo(scale);
   }
 
   function resetZoom() {
     if (graph) fitGraph(graph);
   }
-
   function zoomIn() {
     graph?.zoomIn();
   }
-
   function zoomOut() {
     graph?.zoomOut();
+  }
+
+  function onDragOver(e: DragEvent) {
+    if (!e.dataTransfer?.types.includes('application/x-archi-element')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  }
+
+  function onDrop(e: DragEvent) {
+    if (!graph || !ondropelement) return;
+    const elementId = e.dataTransfer?.getData('application/x-archi-element');
+    if (!elementId) return;
+    e.preventDefault();
+    // Convert screen coords → graph coords
+    const pt = graph.getPointForEvent?.(e as any) || {
+      x: e.offsetX,
+      y: e.offsetY,
+    };
+    ondropelement({ elementId, x: pt.x - 60, y: pt.y - 28 });
   }
 </script>
 
@@ -337,6 +446,9 @@
     <button type="button" class="zoom-btn" onclick={zoomIn} title="Zoom in">+</button>
     <button type="button" class="zoom-btn" onclick={resetZoom} title="Fit diagram">⊙</button>
     <button type="button" class="zoom-btn" onclick={zoomOut} title="Zoom out">−</button>
+  </div>
+  <div class="canvas-hint">
+    Click select · Drag move · Drop from explorer · Right-drag pan · Wheel zoom
   </div>
 
   {#if renderError}
@@ -349,6 +461,8 @@
     role="img"
     aria-label="ArchiMate diagram canvas"
     onwheel={handleWheel}
+    ondragover={onDragOver}
+    ondrop={onDrop}
   ></div>
 </div>
 
@@ -360,23 +474,29 @@
     overflow: hidden;
     background: #1a1f2e;
   }
-
   .graph-container {
     width: 100%;
     height: 100%;
     overflow: hidden;
-    cursor: grab;
     position: relative;
   }
-
-  .graph-container:active {
-    cursor: grabbing;
-  }
-
   :global(.graph-container svg) {
     display: block;
   }
-
+  .canvas-hint {
+    position: absolute;
+    bottom: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 90;
+    font-size: 10px;
+    color: #5a6478;
+    background: rgba(15, 17, 23, 0.75);
+    padding: 3px 10px;
+    border-radius: 12px;
+    pointer-events: none;
+    white-space: nowrap;
+  }
   .canvas-error-banner {
     position: absolute;
     top: 12px;
@@ -390,7 +510,6 @@
     font-size: 12px;
     border-radius: 6px;
   }
-
   .zoom-toolbar {
     position: absolute;
     top: 12px;
@@ -405,7 +524,6 @@
     padding: 4px;
     backdrop-filter: blur(8px);
   }
-
   .zoom-btn {
     width: 28px;
     height: 28px;
@@ -419,12 +537,8 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    transition:
-      background 0.1s,
-      color 0.1s;
     font-family: system-ui;
   }
-
   .zoom-btn:hover {
     background: rgba(77, 142, 240, 0.2);
     color: #4d8ef0;

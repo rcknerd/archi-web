@@ -40,6 +40,7 @@
 
   /* Sizing */
   --sidebar-width:    260px;
+  --props-width:      280px;
   --toolbar-height:   42px;
   --statusbar-height: 24px;
   --radius-sm:        4px;

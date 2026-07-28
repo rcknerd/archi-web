@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { ArchiModelEngine } from './ArchiModelEngine';
-import { absoluteBendpoint, shapeKindForType } from '../canvas/archi-styles';
+import { absoluteBendpoint, shapeKindForType, formatTypeName, RELATIONSHIP_STYLE } from '../canvas/archi-styles';
 
 describe('ArchiModelEngine', () => {
   const engine = new ArchiModelEngine();
@@ -155,6 +155,19 @@ describe('archi-styles helpers', () => {
     expect(shapeKindForType('AndJunction')).toBe('junction');
     expect(shapeKindForType('Grouping')).toBe('grouping');
     expect(shapeKindForType('BusinessService')).toBe('service');
+    expect(shapeKindForType('DataObject')).toBe('object');
+  });
+
+  it('formats type names for UI', () => {
+    expect(formatTypeName('BusinessActor')).toBe('Business Actor');
+    expect(formatTypeName('ServingRelationship')).toBe('Serving');
+  });
+
+  it('places composition diamond at the source (Archi/figure convention)', () => {
+    const c = RELATIONSHIP_STYLE.CompositionRelationship;
+    expect(c.startArrow).toBe('diamond');
+    expect(c.startFill).toBe(true);
+    expect(c.endArrow).toBe('none');
   });
 
   it('converts relative bendpoints to absolute points', () => {
