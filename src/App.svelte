@@ -461,7 +461,10 @@
   function onCanvasDropElement(payload: DropPayload) {
     if (!activeView || !model) return;
     const el = model.elements.get(payload.elementId);
-    if (!el) return;
+    if (!el) {
+      statusNote = `Unknown element id ${payload.elementId}`;
+      return;
+    }
 
     if (alreadyOnView(activeView.nodes, payload.elementId)) {
       selection = { kind: 'element', id: el.id, elementId: el.id };
@@ -469,30 +472,31 @@
       return;
     }
 
-    // Dropped onto an existing diagram object that maps to an ArchiMate element → nest dialog
+    // Dropped onto an existing diagram object → nest / relate dialog
     if (payload.targetDiagramNodeId && payload.targetElementId) {
       const parentEl = model.elements.get(payload.targetElementId);
       if (parentEl && parentEl.id !== el.id) {
         const nestOpts = RelationshipsMatrix.getNestingOptions(parentEl.type, el.type);
-        if (nestOpts.length > 0) {
-          pendingNest = {
-            elementId: el.id,
-            parentDiagramNodeId: payload.targetDiagramNodeId,
-            parentElementId: parentEl.id,
-            x: payload.x,
-            y: payload.y,
-          };
-          dialogSourceName = parentEl.name || parentEl.id;
-          dialogSourceType = parentEl.type;
-          dialogTargetName = el.name || el.id;
-          dialogTargetType = el.type;
-          dialogChoices = nestOpts.map((o) => ({
-            relationshipType: o.relationshipType,
-            direction: o.direction,
-          }));
-          dialogMode = 'nest';
-          return;
-        }
+        // Always open dialog when dropping onto another object — even if no nest rels,
+        // still offer free place / nest without relationship.
+        pendingNest = {
+          elementId: el.id,
+          parentDiagramNodeId: payload.targetDiagramNodeId,
+          parentElementId: parentEl.id,
+          x: payload.x,
+          y: payload.y,
+        };
+        dialogSourceName = parentEl.name || parentEl.id;
+        dialogSourceType = parentEl.type;
+        dialogTargetName = el.name || el.id;
+        dialogTargetType = el.type;
+        dialogChoices = nestOpts.map((o) => ({
+          relationshipType: o.relationshipType,
+          direction: o.direction,
+        }));
+        dialogMode = 'nest';
+        statusNote = `Drop on "${parentEl.name}" — choose nesting`;
+        return;
       }
     }
 
@@ -607,7 +611,7 @@
   function toggleConnectMode() {
     connectMode = !connectMode;
     statusNote = connectMode
-      ? 'Magic connector ON — drag between shapes'
+      ? 'Magic connector ON — click SOURCE element, then TARGET'
       : 'Magic connector off';
   }
 
@@ -732,9 +736,10 @@
                       draggable="true"
                       ondragstart={(e) => {
                         e.dataTransfer?.setData('application/x-archi-element', el.id);
+                        e.dataTransfer?.setData('text/plain', el.id); // fallback for browsers
                         e.dataTransfer!.effectAllowed = 'copy';
                       }}
-                      title="Click to inspect · Drag onto diagram (coming soon)"
+                      title="Click to inspect · Drag onto diagram or onto a shape to nest"
                     >
                       <IconComp size={12} />
                       <span class="item-name">{el.name || el.id}</span>

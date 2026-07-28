@@ -63,6 +63,9 @@
   let lastRenderedViewId = '';
   let suppressSelect = false;
   let fitOnce = false;
+  /** Two-click magic connector: first vertex id chosen as source */
+  let connectSourceId = $state('');
+  let connectStatus = $state('');
 
   $effect(() => {
     if (!graph) return;
@@ -72,6 +75,13 @@
   $effect(() => {
     if (!graph) return;
     applyConnectMode(connectMode);
+    if (!connectMode) {
+      connectSourceId = '';
+      connectStatus = '';
+      clearConnectHighlight();
+    } else {
+      connectStatus = 'Click the SOURCE element';
+    }
   });
 
   $effect(() => {
@@ -91,6 +101,7 @@
       graph = new Graph(containerEl);
 
       graph.setEnabled(true);
+      // ConnectionHandler drag is unreliable with SelectionHandler; we use two-click mode.
       graph.setConnectable(false);
       graph.setCellsEditable(false);
       graph.setCellsResizable(false);
@@ -114,21 +125,47 @@
       graph.isCellMovable = (cell: any) => !connectMode && !!cell?.isVertex?.();
       graph.isCellSelectable = () => true;
 
-      // Only allow connecting diagram vertices that map to ArchiMate elements
-      graph.isValidConnection = (source: any, target: any) => {
-        if (!source?.isVertex?.() || !target?.isVertex?.()) return false;
-        if (source === target) return false;
-        // Allow even without element refs (notes) but magic connector prefers elements
-        return true;
-      };
-
       const container = graph.container as HTMLElement;
       container.style.background = '#1a1f2e';
       container.style.width = '100%';
       container.style.height = '100%';
 
+      // Selection (normal mode) + two-click magic connector
+      graph.addListener(InternalEvent.CLICK, (_sender: unknown, evt: any) => {
+        if (!graph) return;
+        let cell = evt?.getProperty?.('cell') as any;
+        // Fallback hit-test if click event has no cell (HTML labels / overlay)
+        if (!cell) {
+          try {
+            const nativeEvt = evt?.getProperty?.('event');
+            if (nativeEvt) {
+              const pt = (graph as any).getPointForEvent?.(nativeEvt, false);
+              if (pt) cell = findVertexAt(pt.x, pt.y);
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+
+        if (connectMode) {
+          handleConnectClick(cell);
+          try {
+            evt?.consume?.();
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
+
+        // Normal selection fallback if selection model doesn't fire
+        if (!cell) {
+          if (onselect) onselect({ kind: 'none', id: '' });
+        }
+      });
+
       graph.getSelectionModel().addListener(InternalEvent.CHANGE, () => {
         if (suppressSelect || !graph || !onselect) return;
+        if (connectMode) return; // selection handled by connect click path
         const cells = graph.getSelectionCells();
         if (!cells.length) {
           onselect({ kind: 'none', id: '' });
@@ -161,33 +198,6 @@
           onmove({ diagramNodeId: cell.id, x: geo.x, y: geo.y });
         }
       });
-
-      // Magic connector: intercept completed connections
-      try {
-        const ch = graph.getPlugin('ConnectionHandler') as any;
-        ch?.addListener?.(InternalEvent.CONNECT, (_s: unknown, evt: any) => {
-          if (!graph || !onconnectrequest) return;
-          const edge = evt?.getProperty?.('cell');
-          if (!edge) return;
-          const source = edge.getTerminal?.(true) || edge.source;
-          const target = edge.getTerminal?.(false) || edge.target;
-          // Remove provisional edge — App creates the proper ArchiMate relation
-          try {
-            graph.removeCells([edge]);
-          } catch {
-            /* ignore */
-          }
-          if (!source || !target) return;
-          onconnectrequest({
-            sourceDiagramNodeId: source.id,
-            targetDiagramNodeId: target.id,
-            sourceElementId: elementRefByNode.get(source.id),
-            targetElementId: elementRefByNode.get(target.id),
-          });
-        });
-      } catch (e) {
-        console.warn('[DiagramCanvas] ConnectionHandler hook failed', e);
-      }
 
       resizeObserver = new ResizeObserver(() => {
         if (!graph || !containerEl) return;
@@ -223,12 +233,138 @@
 
   function applyConnectMode(enabled: boolean) {
     if (!graph) return;
-    graph.setConnectable(enabled);
+    // Keep ConnectionHandler OFF — two-click path is the reliable UX
+    graph.setConnectable(false);
     graph.isCellMovable = (cell: any) => !enabled && !!cell?.isVertex?.();
+    // Prevent accidental moves while connecting
+    try {
+      (graph as any).setCellsMovable?.(!enabled);
+    } catch {
+      /* optional */
+    }
     const container = graph.container as HTMLElement;
     if (container) {
       container.style.cursor = enabled ? 'crosshair' : 'default';
     }
+  }
+
+  function clearConnectHighlight() {
+    if (!graph) return;
+    for (const cell of nodeMap.values()) {
+      try {
+        const style = { ...(cell.getStyle?.() || graph.getCellStyle?.(cell) || {}) };
+        delete (style as any).strokeColor;
+        // restore default stroke via model style set only if we marked it
+        if ((cell as any)._connectHighlight) {
+          graph.setCellStyles?.('strokeColor', (cell as any)._origStroke || '#3d4659', [cell]);
+          graph.setCellStyles?.('strokeWidth', 1.5, [cell]);
+          (cell as any)._connectHighlight = false;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  function highlightConnectSource(nodeId: string) {
+    if (!graph) return;
+    clearConnectHighlight();
+    const cell = nodeMap.get(nodeId);
+    if (!cell) return;
+    try {
+      const st = graph.getCellStyle?.(cell) || {};
+      (cell as any)._origStroke = st.strokeColor || '#3d4659';
+      (cell as any)._connectHighlight = true;
+      graph.setCellStyles?.('strokeColor', '#4d8ef0', [cell]);
+      graph.setCellStyles?.('strokeWidth', 3, [cell]);
+      suppressSelect = true;
+      graph.setSelectionCell(cell);
+      suppressSelect = false;
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function handleConnectClick(cell: any) {
+    if (!onconnectrequest) {
+      connectStatus = 'No connect handler wired';
+      return;
+    }
+    if (!cell || !cell.isVertex?.()) {
+      // Click empty — reset source
+      if (connectSourceId) {
+        connectSourceId = '';
+        clearConnectHighlight();
+        connectStatus = 'Click the SOURCE element';
+      }
+      return;
+    }
+    const nodeId = cell.id as string;
+    if (!connectSourceId) {
+      connectSourceId = nodeId;
+      highlightConnectSource(nodeId);
+      connectStatus = 'Now click the TARGET element';
+      return;
+    }
+    if (connectSourceId === nodeId) {
+      connectStatus = 'Pick a different target (or click empty to cancel source)';
+      return;
+    }
+    // Complete connection request
+    const sourceId = connectSourceId;
+    const targetId = nodeId;
+    connectSourceId = '';
+    clearConnectHighlight();
+    connectStatus = 'Choose relationship type…';
+    onconnectrequest({
+      sourceDiagramNodeId: sourceId,
+      targetDiagramNodeId: targetId,
+      sourceElementId: elementRefByNode.get(sourceId),
+      targetElementId: elementRefByNode.get(targetId),
+    });
+    // Ready for next pair
+    connectStatus = 'Click the SOURCE element (or exit connector)';
+  }
+
+  /** Hit-test vertex at graph coordinates with small search radius. */
+  function findVertexAt(gx: number, gy: number): any | null {
+    if (!graph) return null;
+    const tryAt = (x: number, y: number) => {
+      try {
+        const c = graph!.getCellAt(x, y, null, true, false);
+        if (c?.isVertex?.()) return c;
+      } catch {
+        /* ignore */
+      }
+      return null;
+    };
+    let cell = tryAt(gx, gy);
+    if (cell) return cell;
+    for (const d of [4, 8, 12, 16, 24]) {
+      for (const [dx, dy] of [
+        [d, 0],
+        [-d, 0],
+        [0, d],
+        [0, -d],
+        [d, d],
+        [-d, -d],
+        [d, -d],
+        [-d, d],
+      ]) {
+        cell = tryAt(gx + dx, gy + dy);
+        if (cell) return cell;
+      }
+    }
+    // Absolute bounds fallback (handles nested/transform quirks)
+    const abs = collectAbsoluteBounds(view.nodes);
+    let best: { id: string; area: number } | null = null;
+    for (const [id, b] of abs) {
+      if (gx >= b.x && gx <= b.x + b.width && gy >= b.y && gy <= b.y + b.height) {
+        const area = b.width * b.height;
+        if (!best || area < best.area) best = { id, area }; // smallest containing = topmost nested
+      }
+    }
+    return best ? nodeMap.get(best.id) ?? null : null;
   }
 
   function applyExternalSelection(id: string) {
@@ -457,45 +593,63 @@
   function clientToGraph(e: DragEvent | MouseEvent): { x: number; y: number } {
     if (!graph || !containerEl) return { x: 0, y: 0 };
     try {
+      // false = don't apply grid offset (more accurate hit-test)
       if (typeof (graph as any).getPointForEvent === 'function') {
-        const pt = (graph as any).getPointForEvent(e);
+        const pt = (graph as any).getPointForEvent(e, false);
         if (pt) return { x: pt.x, y: pt.y };
       }
     } catch {
       /* fall through */
     }
     const rect = containerEl.getBoundingClientRect();
-    const view = graph.getView();
-    const scale = view.getScale();
-    const tr = view.getTranslate();
-    const x = (e.clientX - rect.left) / scale - tr.x;
-    const y = (e.clientY - rect.top) / scale - tr.y;
+    const v = graph.getView();
+    const scale = v.getScale();
+    const tr = v.getTranslate();
+    const panDx = (graph as any).getPanDx?.() || 0;
+    const panDy = (graph as any).getPanDy?.() || 0;
+    const x = (e.clientX - rect.left - panDx) / scale - tr.x;
+    const y = (e.clientY - rect.top - panDy) / scale - tr.y;
     return { x, y };
   }
 
   function onDragOver(e: DragEvent) {
-    if (!e.dataTransfer?.types.includes('application/x-archi-element')) return;
+    // Accept our custom type OR plain text fallback
+    const types = e.dataTransfer ? [...e.dataTransfer.types] : [];
+    if (
+      !types.includes('application/x-archi-element') &&
+      !types.includes('text/plain') &&
+      !types.includes('Text')
+    ) {
+      return;
+    }
     e.preventDefault();
-    e.dataTransfer.dropEffect = 'copy';
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
   }
 
   function onDrop(e: DragEvent) {
     if (!graph || !ondropelement) return;
-    const elementId = e.dataTransfer?.getData('application/x-archi-element');
+    let elementId =
+      e.dataTransfer?.getData('application/x-archi-element') ||
+      e.dataTransfer?.getData('text/plain') ||
+      '';
+    elementId = elementId.trim();
     if (!elementId) return;
     e.preventDefault();
+    e.stopPropagation();
     const pt = clientToGraph(e);
     let targetDiagramNodeId: string | undefined;
     let targetElementId: string | undefined;
-    try {
-      const cell = graph.getCellAt?.(pt.x, pt.y);
-      if (cell?.isVertex?.()) {
-        targetDiagramNodeId = cell.id;
-        targetElementId = elementRefByNode.get(cell.id);
-      }
-    } catch {
-      /* ignore */
+    const cell = findVertexAt(pt.x, pt.y);
+    if (cell?.isVertex?.()) {
+      targetDiagramNodeId = cell.id;
+      targetElementId = elementRefByNode.get(cell.id);
     }
+    console.debug('[DiagramCanvas] drop', {
+      elementId,
+      pt,
+      targetDiagramNodeId,
+      targetElementId,
+    });
     ondropelement({
       elementId,
       x: pt.x - 60,
@@ -514,9 +668,9 @@
   </div>
   <div class="canvas-hint">
     {#if connectMode}
-      Magic connector: drag from source shape to target · Esc / toolbar to exit
+      {connectStatus || 'Magic connector: click SOURCE, then TARGET · Esc to exit'}
     {:else}
-      Click select · Drag move · Drop from explorer · Right-drag pan · Wheel zoom
+      Click select · Drag move · Drop from explorer onto shape to nest · Right-drag pan
     {/if}
   </div>
 
