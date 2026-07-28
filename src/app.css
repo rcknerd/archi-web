@@ -101,6 +101,12 @@ body {
 }
 .btn-primary:hover { background: #6ba3f5; box-shadow: 0 0 12px var(--accent-blue-glow); }
 
+.btn-active {
+  background: var(--accent-blue-glow);
+  color: var(--accent-blue);
+  border-color: var(--accent-blue);
+}
+
 .btn-ghost {
   background: transparent;
   color: var(--text-secondary);

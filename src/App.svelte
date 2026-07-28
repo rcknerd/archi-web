@@ -1,6 +1,6 @@
 <script lang="ts">
   import { ArchiModelEngine } from './lib/model/ArchiModelEngine';
-  import type { ArchiModel, DiagramView, DiagramNode } from './lib/model/types';
+  import type { ArchiModel, DiagramView, DiagramNode, ArchiRelationship, DiagramConnection } from './lib/model/types';
   import type { Selection } from './lib/model/selection';
   import { EMPTY_SELECTION } from './lib/model/selection';
   import {
@@ -14,9 +14,17 @@
     Network,
     Zap,
     Save,
+    Waypoints,
   } from '@lucide/svelte';
   import DiagramCanvas from './lib/canvas/DiagramCanvas.svelte';
+  import type { DropPayload, ConnectRequest } from './lib/canvas/DiagramCanvas.svelte';
   import PropertiesPane from './lib/ui/PropertiesPane.svelte';
+  import RelationshipPickerDialog from './lib/ui/RelationshipPickerDialog.svelte';
+  import type { RelChoice } from './lib/ui/RelationshipPickerDialog.svelte';
+  import {
+    RelationshipsMatrix,
+    type RelationshipTypeName,
+  } from './lib/metamodel/RelationshipsMatrix';
 
   const engine = new ArchiModelEngine();
   const ARCHIMATE_PICKER_TYPES = [
@@ -39,6 +47,25 @@
   let selection = $state<Selection>({ ...EMPTY_SELECTION });
   /** Bumps to remount the canvas after structural view changes (e.g. drop). */
   let viewEpoch = $state(0);
+  /** Magic connector tool active */
+  let connectMode = $state(false);
+
+  // Relationship / nest dialog state
+  type DialogMode = 'none' | 'magic' | 'nest';
+  let dialogMode = $state<DialogMode>('none');
+  let dialogSourceName = $state('');
+  let dialogSourceType = $state('');
+  let dialogTargetName = $state('');
+  let dialogTargetType = $state('');
+  let dialogChoices = $state<RelChoice[]>([]);
+  let pendingNest = $state<{
+    elementId: string;
+    parentDiagramNodeId: string;
+    parentElementId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  let pendingConnect = $state<ConnectRequest | null>(null);
 
   const layerIcon: Record<string, any> = {
     strategy: Zap,
@@ -270,38 +297,152 @@
     }
   }
 
-  /** Drop an explorer element onto the diagram (adds a diagram object if missing). */
-  function onCanvasDropElement(payload: { elementId: string; x: number; y: number }) {
-    if (!activeView || !model) return;
-    const el = model.elements.get(payload.elementId);
-    if (!el) return;
+  function newId(prefix: string): string {
+    return `${prefix}-${crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`}`;
+  }
 
-    const alreadyOnView = (nodes: DiagramNode[]): boolean => {
-      for (const n of nodes) {
-        if (n.archimateElementId === payload.elementId) return true;
-        if (n.children?.length && alreadyOnView(n.children)) return true;
+  function alreadyOnView(nodes: DiagramNode[], elementId: string): boolean {
+    for (const n of nodes) {
+      if (n.archimateElementId === elementId) return true;
+      if (n.children?.length && alreadyOnView(n.children, elementId)) return true;
+    }
+    return false;
+  }
+
+  function findNode(nodes: DiagramNode[], id: string): DiagramNode | null {
+    for (const n of nodes) {
+      if (n.id === id) return n;
+      if (n.children?.length) {
+        const f = findNode(n.children, id);
+        if (f) return f;
       }
-      return false;
-    };
-    if (alreadyOnView(activeView.nodes)) {
-      selection = { kind: 'element', id: el.id, elementId: el.id };
-      statusNote = `"${el.name}" is already on this view`;
+    }
+    return null;
+  }
+
+  function appendChildToNode(nodes: DiagramNode[], parentId: string, child: DiagramNode): boolean {
+    for (const n of nodes) {
+      if (n.id === parentId) {
+        n.children = [...(n.children || []), child];
+        return true;
+      }
+      if (n.children?.length && appendChildToNode(n.children, parentId, child)) return true;
+    }
+    return false;
+  }
+
+  /** Create ArchiMate relationship + diagram connection between two diagram nodes. */
+  function createRelationshipAndConnection(
+    sourceDiagramNodeId: string,
+    targetDiagramNodeId: string,
+    relationshipType: RelationshipTypeName,
+  ) {
+    if (!activeView || !model) return;
+    const srcNode = findNode(activeView.nodes, sourceDiagramNodeId);
+    const tgtNode = findNode(activeView.nodes, targetDiagramNodeId);
+    if (!srcNode || !tgtNode) return;
+
+    const sourceElId = srcNode.archimateElementId;
+    const targetElId = tgtNode.archimateElementId;
+    if (!sourceElId || !targetElId) {
+      statusNote = 'Both ends must be ArchiMate elements';
       return;
     }
 
-    const id = `diag-${crypto.randomUUID?.() || Date.now()}`;
+    // Avoid duplicate concept-level relationship of same type
+    for (const r of model.relationships.values()) {
+      if (
+        r.sourceId === sourceElId &&
+        r.targetId === targetElId &&
+        r.type === relationshipType
+      ) {
+        // Still add diagram connection if missing
+        const existsConn = activeView.connections.some(
+          (c) =>
+            c.sourceId === sourceDiagramNodeId &&
+            c.targetId === targetDiagramNodeId &&
+            c.relationshipId === r.id,
+        );
+        if (!existsConn) {
+          const conn: DiagramConnection = {
+            id: newId('conn'),
+            relationshipId: r.id,
+            sourceId: sourceDiagramNodeId,
+            targetId: targetDiagramNodeId,
+            type: 'Connection',
+          };
+          activeView.connections = [...activeView.connections, conn];
+          activeView = { ...activeView };
+          dirty = true;
+          viewEpoch += 1;
+          statusNote = `Linked existing ${RelationshipsMatrix.label(relationshipType)}`;
+        } else {
+          statusNote = 'Relationship and connection already exist';
+        }
+        selection = { kind: 'relationship', id: r.id };
+        return;
+      }
+    }
+
+    const relId = newId('rel');
+    const rel: ArchiRelationship = {
+      id: relId,
+      type: relationshipType,
+      sourceId: sourceElId,
+      targetId: targetElId,
+      name: '',
+    };
+    model.relationships.set(relId, rel);
+
+    const conn: DiagramConnection = {
+      id: newId('conn'),
+      relationshipId: relId,
+      sourceId: sourceDiagramNodeId,
+      targetId: targetDiagramNodeId,
+      type: 'Connection',
+    };
+    activeView.connections = [...activeView.connections, conn];
+    activeView = { ...activeView };
+    model = model;
+    dirty = true;
+    viewEpoch += 1;
+    selection = { kind: 'relationship', id: relId };
+    statusNote = `Created ${RelationshipsMatrix.label(relationshipType)} (unsaved)`;
+  }
+
+  function placeNodeOnView(
+    elId: string,
+    x: number,
+    y: number,
+    parentDiagramNodeId?: string,
+  ): string | null {
+    if (!activeView || !model) return null;
+    const el = model.elements.get(elId);
+    if (!el) return null;
+
+    const id = newId('diag');
     const node: DiagramNode = {
       id,
       archimateElementId: el.id,
       name: el.name,
       type: 'DiagramObject',
-      x: Math.round(payload.x),
-      y: Math.round(payload.y),
+      x: Math.round(x),
+      y: Math.round(y),
       width: 120,
       height: 55,
     };
-    activeView.nodes = [...activeView.nodes, node];
-    // Force canvas remount via view identity-preserving update + key bump
+
+    if (parentDiagramNodeId) {
+      // Nested coordinates relative to parent — place near top-left inside
+      node.x = 20;
+      node.y = 40;
+      if (!appendChildToNode(activeView.nodes, parentDiagramNodeId, node)) {
+        activeView.nodes = [...activeView.nodes, node];
+      }
+    } else {
+      activeView.nodes = [...activeView.nodes, node];
+    }
+
     activeView = { ...activeView, nodes: activeView.nodes };
     model = model;
     dirty = true;
@@ -312,8 +453,173 @@
       diagramNodeId: id,
       viewId: activeView.id,
     };
-    statusNote = `Added "${el.name}" to view (unsaved)`;
     viewEpoch += 1;
+    return id;
+  }
+
+  /** Drop from explorer — free place or nest dialog when dropped on a shape. */
+  function onCanvasDropElement(payload: DropPayload) {
+    if (!activeView || !model) return;
+    const el = model.elements.get(payload.elementId);
+    if (!el) return;
+
+    if (alreadyOnView(activeView.nodes, payload.elementId)) {
+      selection = { kind: 'element', id: el.id, elementId: el.id };
+      statusNote = `"${el.name}" is already on this view`;
+      return;
+    }
+
+    // Dropped onto an existing diagram object that maps to an ArchiMate element → nest dialog
+    if (payload.targetDiagramNodeId && payload.targetElementId) {
+      const parentEl = model.elements.get(payload.targetElementId);
+      if (parentEl && parentEl.id !== el.id) {
+        const nestOpts = RelationshipsMatrix.getNestingOptions(parentEl.type, el.type);
+        if (nestOpts.length > 0) {
+          pendingNest = {
+            elementId: el.id,
+            parentDiagramNodeId: payload.targetDiagramNodeId,
+            parentElementId: parentEl.id,
+            x: payload.x,
+            y: payload.y,
+          };
+          dialogSourceName = parentEl.name || parentEl.id;
+          dialogSourceType = parentEl.type;
+          dialogTargetName = el.name || el.id;
+          dialogTargetType = el.type;
+          dialogChoices = nestOpts.map((o) => ({
+            relationshipType: o.relationshipType,
+            direction: o.direction,
+          }));
+          dialogMode = 'nest';
+          return;
+        }
+      }
+    }
+
+    // Free placement on canvas
+    placeNodeOnView(el.id, payload.x, payload.y);
+    statusNote = `Added "${el.name}" to view (unsaved)`;
+  }
+
+  function onNestSelect(choice: RelChoice) {
+    if (!pendingNest || !model) {
+      closeDialog();
+      return;
+    }
+    const { elementId, parentDiagramNodeId, parentElementId, x, y } = pendingNest;
+    const childNodeId = placeNodeOnView(elementId, x, y, parentDiagramNodeId);
+    if (!childNodeId) {
+      closeDialog();
+      return;
+    }
+
+    // Wire relationship according to direction
+    if (choice.direction === 'child-to-parent') {
+      createRelationshipAndConnection(
+        childNodeId,
+        parentDiagramNodeId,
+        choice.relationshipType,
+      );
+    } else {
+      createRelationshipAndConnection(
+        parentDiagramNodeId,
+        childNodeId,
+        choice.relationshipType,
+      );
+    }
+    statusNote = `Nested with ${RelationshipsMatrix.label(choice.relationshipType)} (unsaved)`;
+    closeDialog();
+  }
+
+  function onNestSkip() {
+    if (!pendingNest) {
+      closeDialog();
+      return;
+    }
+    // Nest visually without relationship, or free place?
+    // Archi: user can nest without creating relation — nest as child, no rel
+    placeNodeOnView(
+      pendingNest.elementId,
+      pendingNest.x,
+      pendingNest.y,
+      pendingNest.parentDiagramNodeId,
+    );
+    statusNote = 'Nested without relationship (unsaved)';
+    closeDialog();
+  }
+
+  function onNestPlaceFree() {
+    if (!pendingNest) {
+      closeDialog();
+      return;
+    }
+    placeNodeOnView(pendingNest.elementId, pendingNest.x, pendingNest.y);
+    statusNote = 'Placed on view (not nested)';
+    closeDialog();
+  }
+
+  /** Magic connector finished a drag between two shapes. */
+  function onConnectRequest(req: ConnectRequest) {
+    if (!model || !activeView) return;
+    const srcEl = req.sourceElementId ? model.elements.get(req.sourceElementId) : undefined;
+    const tgtEl = req.targetElementId ? model.elements.get(req.targetElementId) : undefined;
+    if (!srcEl || !tgtEl) {
+      statusNote = 'Magic connector needs ArchiMate elements at both ends';
+      return;
+    }
+    const valid = RelationshipsMatrix.getValidRelationships(srcEl.type, tgtEl.type);
+    if (valid.length === 0) {
+      statusNote = `No ArchiMate relation allowed: ${srcEl.type} → ${tgtEl.type}`;
+      return;
+    }
+    pendingConnect = req;
+    dialogSourceName = srcEl.name || srcEl.id;
+    dialogSourceType = srcEl.type;
+    dialogTargetName = tgtEl.name || tgtEl.id;
+    dialogTargetType = tgtEl.type;
+    dialogChoices = valid.map((relationshipType) => ({
+      relationshipType,
+      direction: 'source-to-target' as const,
+    }));
+    dialogMode = 'magic';
+  }
+
+  function onMagicSelect(choice: RelChoice) {
+    if (!pendingConnect) {
+      closeDialog();
+      return;
+    }
+    createRelationshipAndConnection(
+      pendingConnect.sourceDiagramNodeId,
+      pendingConnect.targetDiagramNodeId,
+      choice.relationshipType,
+    );
+    closeDialog();
+  }
+
+  function closeDialog() {
+    dialogMode = 'none';
+    pendingNest = null;
+    pendingConnect = null;
+    dialogChoices = [];
+  }
+
+  function toggleConnectMode() {
+    connectMode = !connectMode;
+    statusNote = connectMode
+      ? 'Magic connector ON — drag between shapes'
+      : 'Magic connector off';
+  }
+
+  // Esc exits connect mode
+  function onKeyDown(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      if (dialogMode !== 'none') closeDialog();
+      else if (connectMode) {
+        connectMode = false;
+        statusNote = 'Magic connector off';
+      }
+    }
   }
 
   function countNodes(nodes: { children?: any[] }[]): number {
@@ -332,7 +638,8 @@
   );
 </script>
 
-<div class="workbench">
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+<div class="workbench" onkeydown={onKeyDown} role="application">
   <!-- ── Toolbar ── -->
   <header class="toolbar">
     <div class="toolbar-brand">
@@ -351,6 +658,15 @@
       <button class="btn" onclick={saveFileAs} disabled={!model || isSaving} title="Save as…">
         Save as…
       </button>
+      <button
+        class="btn {connectMode ? 'btn-active' : ''}"
+        onclick={toggleConnectMode}
+        disabled={!model || !activeView}
+        title="Magic connector — create ArchiMate relationships allowed by the metamodel"
+      >
+        <Waypoints size={14} />
+        {connectMode ? 'Connecting…' : 'Magic connector'}
+      </button>
     </nav>
     {#if model}
       <div class="toolbar-model-name" title={fileName || model.name}>
@@ -359,7 +675,7 @@
       </div>
     {/if}
     <div class="toolbar-spacer"></div>
-    <div class="toolbar-badge">Phase 4 · Select · Move · Inspect</div>
+    <div class="toolbar-badge">Phase 4 · Magic connector · Nest</div>
   </header>
 
   <!-- ── Body ── -->
@@ -491,9 +807,11 @@
               view={activeView}
               model={model}
               selectedId={selectedKey}
+              connectMode={connectMode}
               onselect={onCanvasSelect}
               onmove={onNodeMove}
               ondropelement={onCanvasDropElement}
+              onconnectrequest={onConnectRequest}
             />
           {/key}
         </div>
@@ -512,6 +830,38 @@
       onclear={clearSelection}
     />
   </div>
+
+  <!-- Magic connector relationship picker -->
+  <RelationshipPickerDialog
+    open={dialogMode === 'magic'}
+    title="Magic connector"
+    subtitle="ArchiMate metamodel — choose a valid relationship"
+    sourceName={dialogSourceName}
+    sourceType={dialogSourceType}
+    targetName={dialogTargetName}
+    targetType={dialogTargetType}
+    choices={dialogChoices}
+    onselect={onMagicSelect}
+    oncancel={closeDialog}
+  />
+
+  <!-- Nest-on-drop dialog -->
+  <RelationshipPickerDialog
+    open={dialogMode === 'nest'}
+    title="Nest element?"
+    subtitle="Drop onto an object — nest with a metamodel relationship, nest only, or place free"
+    sourceName={dialogSourceName}
+    sourceType={dialogSourceType}
+    targetName={dialogTargetName}
+    targetType={dialogTargetType}
+    choices={dialogChoices}
+    allowSkip={true}
+    skipLabel="Nest without relationship"
+    cancelLabel="Place free (not nested)"
+    onselect={onNestSelect}
+    onskip={onNestSkip}
+    oncancel={onNestPlaceFree}
+  />
 
   <!-- ── Status bar ── -->
   <footer class="statusbar">

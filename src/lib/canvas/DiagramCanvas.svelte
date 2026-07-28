@@ -1,11 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import {
-    Graph,
-    InternalEvent,
-    Point,
-    Geometry,
-  } from '@maxgraph/core';
+  import { Graph, InternalEvent, Point, Geometry } from '@maxgraph/core';
   import type { FitPlugin } from '@maxgraph/core';
   import '@maxgraph/core/css/common.css';
   import type { ArchiModel, DiagramView, DiagramNode, DiagramConnection } from '../model/types';
@@ -20,36 +15,65 @@
     baseEdgeStyle,
   } from './archi-styles';
 
+  export type DropPayload = {
+    elementId: string;
+    x: number;
+    y: number;
+    /** Diagram node under the drop point, if any (for nesting). */
+    targetDiagramNodeId?: string;
+    targetElementId?: string;
+  };
+
+  export type ConnectRequest = {
+    sourceDiagramNodeId: string;
+    targetDiagramNodeId: string;
+    sourceElementId?: string;
+    targetElementId?: string;
+  };
+
   interface Props {
     view: DiagramView;
     model: ArchiModel;
     selectedId?: string;
+    /** Magic connector mode — drag between shapes to create ArchiMate relations. */
+    connectMode?: boolean;
     onselect?: (sel: Selection) => void;
     onmove?: (payload: { diagramNodeId: string; x: number; y: number }) => void;
-    ondropelement?: (payload: { elementId: string; x: number; y: number }) => void;
+    ondropelement?: (payload: DropPayload) => void;
+    onconnectrequest?: (payload: ConnectRequest) => void;
   }
 
-  let { view, model, selectedId = '', onselect, onmove, ondropelement }: Props = $props();
+  let {
+    view,
+    model,
+    selectedId = '',
+    connectMode = false,
+    onselect,
+    onmove,
+    ondropelement,
+    onconnectrequest,
+  }: Props = $props();
 
   let containerEl: HTMLDivElement;
   let graph: Graph | null = null;
   let renderError = $state('');
   let resizeObserver: ResizeObserver | null = null;
   let nodeMap = new Map<string, any>();
-  /** diagram node id → archimate element id */
   let elementRefByNode = new Map<string, string>();
   let lastRenderedViewId = '';
   let suppressSelect = false;
   let fitOnce = false;
 
-  // External selection → highlight cell
   $effect(() => {
-    const id = selectedId;
     if (!graph) return;
-    applyExternalSelection(id);
+    applyExternalSelection(selectedId);
   });
 
-  // Re-render only when the view changes (not on every model mutation from move)
+  $effect(() => {
+    if (!graph) return;
+    applyConnectMode(connectMode);
+  });
+
   $effect(() => {
     const vid = view.id;
     const _model = model;
@@ -64,10 +88,8 @@
   onMount(() => {
     try {
       InternalEvent.disableContextMenu(containerEl);
-
       graph = new Graph(containerEl);
 
-      // Interactive: select + move, no new connections / no text edit
       graph.setEnabled(true);
       graph.setConnectable(false);
       graph.setCellsEditable(false);
@@ -80,26 +102,31 @@
       graph.setTooltips(true);
       graph.centerZoom = true;
 
-      // Panning: right-button / middle (left-click selects & moves)
       graph.setPanning(true);
       try {
         const ph = graph.getPlugin('PanningHandler') as any;
         ph?.setUseLeftButtonForPanning?.(false);
-        if (ph) ph.usePopupTrigger = true; // right-drag pans
+        if (ph) ph.usePopupTrigger = true;
       } catch {
         /* optional */
       }
 
-      // Only vertices movable (not edges); junctions stay small
-      graph.isCellMovable = (cell: any) => !!cell?.isVertex?.();
+      graph.isCellMovable = (cell: any) => !connectMode && !!cell?.isVertex?.();
       graph.isCellSelectable = () => true;
+
+      // Only allow connecting diagram vertices that map to ArchiMate elements
+      graph.isValidConnection = (source: any, target: any) => {
+        if (!source?.isVertex?.() || !target?.isVertex?.()) return false;
+        if (source === target) return false;
+        // Allow even without element refs (notes) but magic connector prefers elements
+        return true;
+      };
 
       const container = graph.container as HTMLElement;
       container.style.background = '#1a1f2e';
       container.style.width = '100%';
       container.style.height = '100%';
 
-      // Selection → parent
       graph.getSelectionModel().addListener(InternalEvent.CHANGE, () => {
         if (suppressSelect || !graph || !onselect) return;
         const cells = graph.getSelectionCells();
@@ -111,11 +138,7 @@
         const nodeId = cell.id as string;
         if (cell.isEdge?.()) {
           const relId = (cell as any)._relationshipId as string | undefined;
-          onselect({
-            kind: 'relationship',
-            id: relId || nodeId,
-            viewId: view.id,
-          });
+          onselect({ kind: 'relationship', id: relId || nodeId, viewId: view.id });
           return;
         }
         const elementId = elementRefByNode.get(nodeId);
@@ -128,9 +151,8 @@
         });
       });
 
-      // Move finished → update model geometry
       graph.addListener(InternalEvent.CELLS_MOVED, (_sender: unknown, evt: any) => {
-        if (!onmove || !graph) return;
+        if (!onmove || !graph || connectMode) return;
         const cells: any[] = evt?.getProperty?.('cells') || [];
         for (const cell of cells) {
           if (!cell?.isVertex?.()) continue;
@@ -140,13 +162,32 @@
         }
       });
 
-      // Fallback: also listen to mouse-up via model change for geometry
-      graph.getDataModel().addListener(InternalEvent.CHANGE, (_s: unknown, evt: any) => {
-        if (!onmove || !graph) return;
-        // Only process when not mid full re-render
-        const edits = evt?.getProperty?.('edit')?.changes || evt?.getProperty?.('changes');
-        if (!edits) return;
-      });
+      // Magic connector: intercept completed connections
+      try {
+        const ch = graph.getPlugin('ConnectionHandler') as any;
+        ch?.addListener?.(InternalEvent.CONNECT, (_s: unknown, evt: any) => {
+          if (!graph || !onconnectrequest) return;
+          const edge = evt?.getProperty?.('cell');
+          if (!edge) return;
+          const source = edge.getTerminal?.(true) || edge.source;
+          const target = edge.getTerminal?.(false) || edge.target;
+          // Remove provisional edge — App creates the proper ArchiMate relation
+          try {
+            graph.removeCells([edge]);
+          } catch {
+            /* ignore */
+          }
+          if (!source || !target) return;
+          onconnectrequest({
+            sourceDiagramNodeId: source.id,
+            targetDiagramNodeId: target.id,
+            sourceElementId: elementRefByNode.get(source.id),
+            targetElementId: elementRefByNode.get(target.id),
+          });
+        });
+      } catch (e) {
+        console.warn('[DiagramCanvas] ConnectionHandler hook failed', e);
+      }
 
       resizeObserver = new ResizeObserver(() => {
         if (!graph || !containerEl) return;
@@ -180,6 +221,16 @@
     }
   });
 
+  function applyConnectMode(enabled: boolean) {
+    if (!graph) return;
+    graph.setConnectable(enabled);
+    graph.isCellMovable = (cell: any) => !enabled && !!cell?.isVertex?.();
+    const container = graph.container as HTMLElement;
+    if (container) {
+      container.style.cursor = enabled ? 'crosshair' : 'default';
+    }
+  }
+
   function applyExternalSelection(id: string) {
     if (!graph) return;
     suppressSelect = true;
@@ -188,7 +239,6 @@
         graph.clearSelection();
         return;
       }
-      // Find cell by diagram node id or by archimate element id
       let cell = nodeMap.get(id);
       if (!cell) {
         for (const [nodeId, elId] of elementRefByNode) {
@@ -240,21 +290,17 @@
   function collectAbsoluteBounds(
     nodes: DiagramNode[],
     parentAbs = { x: 0, y: 0 },
-    out = new Map<string, { x: number; y: number; width: number; height: number; cx: number; cy: number }>(),
+    out = new Map<
+      string,
+      { x: number; y: number; width: number; height: number; cx: number; cy: number }
+    >(),
   ) {
     for (const node of nodes) {
       const x = parentAbs.x + node.x;
       const y = parentAbs.y + node.y;
       const width = node.width || 120;
       const height = node.height || 55;
-      out.set(node.id, {
-        x,
-        y,
-        width,
-        height,
-        cx: x + width / 2,
-        cy: y + height / 2,
-      });
+      out.set(node.id, { x, y, width, height, cx: x + width / 2, cy: y + height / 2 });
       if (node.children?.length) collectAbsoluteBounds(node.children, { x, y }, out);
     }
     return out;
@@ -313,34 +359,21 @@
             style: style as any,
           });
           nodeMap.set(node.id, cell);
-          if (node.archimateElementId) {
-            elementRefByNode.set(node.id, node.archimateElementId);
-          }
+          if (node.archimateElementId) elementRefByNode.set(node.id, node.archimateElementId);
 
-          for (const child of node.children || []) {
-            insertNode(child, cell);
-          }
+          for (const child of node.children || []) insertNode(child, cell);
         };
 
-        for (const node of v.nodes) {
-          insertNode(node, rootParent);
-        }
-
-        for (const conn of v.connections) {
-          insertConnection(g, conn, m, absBounds, rootParent);
-        }
+        for (const node of v.nodes) insertNode(node, rootParent);
+        for (const conn of v.connections) insertConnection(g, conn, m, absBounds, rootParent);
       });
 
       g.view?.validate?.();
       g.sizeDidChange();
       fitGraph(g);
       fitOnce = true;
-
+      applyConnectMode(connectMode);
       if (selectedId) applyExternalSelection(selectedId);
-
-      console.debug(
-        `[DiagramCanvas] "${v.name}": ${nodeMap.size} nodes, ${v.connections.length} edges`,
-      );
     } catch (err: any) {
       console.error('[DiagramCanvas] render failed', err);
       renderError = `Render failed: ${err?.message || err}`;
@@ -351,7 +384,10 @@
     g: Graph,
     conn: DiagramConnection,
     m: ArchiModel,
-    absBounds: Map<string, { cx: number; cy: number; x: number; y: number; width: number; height: number }>,
+    absBounds: Map<
+      string,
+      { cx: number; cy: number; x: number; y: number; width: number; height: number }
+    >,
     parent: any,
   ) {
     const sourceCell = nodeMap.get(conn.sourceId);
@@ -361,13 +397,10 @@
     const rel = conn.relationshipId ? m.relationships.get(conn.relationshipId) : undefined;
     const relType = cleanType(rel?.type ?? conn.type ?? 'AssociationRelationship');
     const relStyle = RELATIONSHIP_STYLE[relType] ?? DEFAULT_EDGE_STYLE;
-
-    // Prefer saved bendpoints (Archi layout); otherwise Manhattan auto-routing
     const hasBendpoints = !!(conn.bendpoints && conn.bendpoints.length);
     const edgeStyle = baseEdgeStyle({
       ...relStyle,
       strokeColor: conn.lineColor ?? '#4a5568',
-      // With explicit bendpoints use orthogonal so points are respected
       edgeStyle: hasBendpoints ? 'orthogonalEdgeStyle' : 'manhattanEdgeStyle',
     });
 
@@ -376,7 +409,7 @@
       id: conn.id,
       source: sourceCell,
       target: targetCell,
-      value: '', // keep edges clean — names live in properties pane
+      value: '',
       style: edgeStyle as any,
     });
     (edge as any)._relationshipId = conn.relationshipId || conn.id;
@@ -396,8 +429,8 @@
             next.points = points;
             g.getDataModel().setGeometry(edge, next);
           }
-        } catch (e) {
-          console.warn('[DiagramCanvas] bendpoint apply failed', e);
+        } catch {
+          /* ignore */
         }
       }
     }
@@ -421,6 +454,25 @@
     graph?.zoomOut();
   }
 
+  function clientToGraph(e: DragEvent | MouseEvent): { x: number; y: number } {
+    if (!graph || !containerEl) return { x: 0, y: 0 };
+    try {
+      if (typeof (graph as any).getPointForEvent === 'function') {
+        const pt = (graph as any).getPointForEvent(e);
+        if (pt) return { x: pt.x, y: pt.y };
+      }
+    } catch {
+      /* fall through */
+    }
+    const rect = containerEl.getBoundingClientRect();
+    const view = graph.getView();
+    const scale = view.getScale();
+    const tr = view.getTranslate();
+    const x = (e.clientX - rect.left) / scale - tr.x;
+    const y = (e.clientY - rect.top) / scale - tr.y;
+    return { x, y };
+  }
+
   function onDragOver(e: DragEvent) {
     if (!e.dataTransfer?.types.includes('application/x-archi-element')) return;
     e.preventDefault();
@@ -432,23 +484,40 @@
     const elementId = e.dataTransfer?.getData('application/x-archi-element');
     if (!elementId) return;
     e.preventDefault();
-    // Convert screen coords → graph coords
-    const pt = graph.getPointForEvent?.(e as any) || {
-      x: e.offsetX,
-      y: e.offsetY,
-    };
-    ondropelement({ elementId, x: pt.x - 60, y: pt.y - 28 });
+    const pt = clientToGraph(e);
+    let targetDiagramNodeId: string | undefined;
+    let targetElementId: string | undefined;
+    try {
+      const cell = graph.getCellAt?.(pt.x, pt.y);
+      if (cell?.isVertex?.()) {
+        targetDiagramNodeId = cell.id;
+        targetElementId = elementRefByNode.get(cell.id);
+      }
+    } catch {
+      /* ignore */
+    }
+    ondropelement({
+      elementId,
+      x: pt.x - 60,
+      y: pt.y - 28,
+      targetDiagramNodeId,
+      targetElementId,
+    });
   }
 </script>
 
-<div class="canvas-wrapper">
+<div class="canvas-wrapper" class:connect-mode={connectMode}>
   <div class="zoom-toolbar">
     <button type="button" class="zoom-btn" onclick={zoomIn} title="Zoom in">+</button>
     <button type="button" class="zoom-btn" onclick={resetZoom} title="Fit diagram">⊙</button>
     <button type="button" class="zoom-btn" onclick={zoomOut} title="Zoom out">−</button>
   </div>
   <div class="canvas-hint">
-    Click select · Drag move · Drop from explorer · Right-drag pan · Wheel zoom
+    {#if connectMode}
+      Magic connector: drag from source shape to target · Esc / toolbar to exit
+    {:else}
+      Click select · Drag move · Drop from explorer · Right-drag pan · Wheel zoom
+    {/if}
   </div>
 
   {#if renderError}
@@ -474,6 +543,10 @@
     overflow: hidden;
     background: #1a1f2e;
   }
+  .canvas-wrapper.connect-mode {
+    outline: 2px solid rgba(77, 142, 240, 0.45);
+    outline-offset: -2px;
+  }
   .graph-container {
     width: 100%;
     height: 100%;
@@ -496,6 +569,10 @@
     border-radius: 12px;
     pointer-events: none;
     white-space: nowrap;
+  }
+  .connect-mode .canvas-hint {
+    color: #93c5fd;
+    border: 1px solid rgba(77, 142, 240, 0.35);
   }
   .canvas-error-banner {
     position: absolute;
@@ -522,7 +599,6 @@
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 8px;
     padding: 4px;
-    backdrop-filter: blur(8px);
   }
   .zoom-btn {
     width: 28px;
